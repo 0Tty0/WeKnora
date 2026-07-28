@@ -214,6 +214,21 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 	}
 
 	lang := types.LanguageFromContextOrDefault(ctx)
+	attempt := 0
+	if root, allocated, openErr := s.tracker().OpenAttempt(
+		ctx,
+		knowledge.ID,
+		"",
+	); openErr == nil && root != nil {
+		attempt = allocated
+	} else if openErr != nil {
+		logger.Warnf(
+			ctx,
+			"Failed to allocate processing attempt for %s: %v",
+			knowledge.ID,
+			openErr,
+		)
+	}
 	taskPayload := types.DocumentProcessPayload{
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
@@ -225,6 +240,7 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		EnableQuestionGeneration: enableQuestionGeneration,
 		QuestionCount:            questionCount,
 		Language:                 lang,
+		Attempt:                  attempt,
 	}
 
 	langfuse.InjectTracing(ctx, &taskPayload)
@@ -271,7 +287,17 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		knowledge.ID,
 	)
 
-	enqueueDataTableSummaryIfNeeded(ctx, s.task, tenantID, knowledge.ID, safeFilename, getFileType(safeFilename), kb.SummaryModelID, kb.EmbeddingModelID)
+	enqueueDataTableSummaryIfNeeded(
+		ctx,
+		s.task,
+		tenantID,
+		knowledge.ID,
+		safeFilename,
+		getFileType(safeFilename),
+		kb.SummaryModelID,
+		kb.EmbeddingModelID,
+		attempt,
+	)
 
 	logger.Infof(ctx, "Knowledge from file created successfully, ID: %s", knowledge.ID)
 	return knowledge, nil
@@ -703,7 +729,17 @@ func (s *knowledgeService) createKnowledgeFromFileURL(
 		})
 	logger.Infof(ctx, "Enqueued file URL process task: id=%s queue=%s knowledge_id=%s", info.ID, info.Queue, knowledge.ID)
 
-	enqueueDataTableSummaryIfNeeded(ctx, s.task, tenantID, knowledge.ID, fileName, fileType, kb.SummaryModelID, kb.EmbeddingModelID)
+	enqueueDataTableSummaryIfNeeded(
+		ctx,
+		s.task,
+		tenantID,
+		knowledge.ID,
+		fileName,
+		fileType,
+		kb.SummaryModelID,
+		kb.EmbeddingModelID,
+		0,
+	)
 
 	logger.Infof(ctx, "Knowledge from file URL created successfully, ID: %s", knowledge.ID)
 	return knowledge, nil
@@ -818,13 +854,13 @@ func (s *knowledgeService) CreateKnowledgeFromManual(ctx context.Context,
 
 	if status == types.ManualKnowledgeStatusPublish {
 		logger.Infof(ctx, "Manual knowledge created, enqueuing async processing task, ID: %s", knowledge.ID)
-		taskID, err := s.enqueueManualProcessing(ctx, knowledge, cleanContent, false)
+		taskID, attempt, err := s.enqueueManualProcessing(ctx, knowledge, cleanContent, false)
 		if err != nil {
 			logger.Errorf(ctx, "Failed to enqueue manual processing task for new knowledge: %v", err)
 			// Non-fatal: mark as failed so user can retry
 			knowledge.ParseStatus = "failed"
 			knowledge.ErrorMessage = "Failed to enqueue processing task"
-			s.repo.UpdateKnowledge(ctx, knowledge)
+			_, _ = s.repo.UpdateKnowledgeIfAttemptCurrent(ctx, knowledge, attempt)
 			recordKBActivity(ctx, s.audit, tenantID, kbID, types.AuditActionKnowledgeCreated,
 				"knowledge", knowledge.ID, types.AuditOutcomeFailed, map[string]any{
 					"title": knowledge.Title, "source_type": "manual", "status": status,
@@ -1050,12 +1086,11 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 	existing.FileType = types.KnowledgeTypeManual
 	existing.Type = types.KnowledgeTypeManual
 	existing.Source = types.KnowledgeTypeManual
-	existing.EnableStatus = "disabled"
 	existing.UpdatedAt = time.Now()
-	existing.EmbeddingModelID = kb.EmbeddingModelID
 
 	if status == types.ManualKnowledgeStatusDraft {
 		existing.ParseStatus = types.ManualKnowledgeStatusDraft
+		existing.EnableStatus = "disabled"
 		existing.Description = ""
 		existing.ProcessedAt = nil
 
@@ -1070,10 +1105,9 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 		return existing, nil
 	}
 
-	// Publish: persist pending status and enqueue async task for cleanup + re-indexing
+	// Publish: keep the last live description/enable/model binding while the
+	// desired generation is built, then switch them in processChunks.
 	existing.ParseStatus = "pending"
-	existing.Description = ""
-	existing.ProcessedAt = nil
 
 	if _, err := ApplyKnowledgeProcessOverrides(ctx, kb, existing, payload.ProcessConfig, nil, nil); err != nil {
 		return nil, err
@@ -1085,13 +1119,13 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 	}
 
 	logger.Infof(ctx, "Manual knowledge updated, enqueuing async processing task, ID: %s", existing.ID)
-	taskID, err := s.enqueueManualProcessing(ctx, existing, cleanContent, true)
+	taskID, attempt, err := s.enqueueManualProcessing(ctx, existing, cleanContent, true)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to enqueue manual processing task: %v", err)
 		// Non-fatal: mark as failed so user can retry
 		existing.ParseStatus = "failed"
 		existing.ErrorMessage = "Failed to enqueue processing task"
-		s.repo.UpdateKnowledge(ctx, existing)
+		_, _ = s.repo.UpdateKnowledgeIfAttemptCurrent(ctx, existing, attempt)
 		recordKBActivity(ctx, s.audit, tenantID, existing.KnowledgeBaseID, types.AuditActionKnowledgeUpdated,
 			"knowledge", existing.ID, types.AuditOutcomeFailed, map[string]any{
 				"title": existing.Title, "status": status,
@@ -1107,10 +1141,27 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 	return existing, nil
 }
 
-// enqueueManualProcessing enqueues a manual:process Asynq task for async cleanup + re-indexing.
+// enqueueManualProcessing enqueues desired-state manual processing.
 func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
 	knowledge *types.Knowledge, content string, needCleanup bool,
-) (string, error) {
+) (string, int, error) {
+	attempt := attemptFromCtx(ctx)
+	if attempt <= 0 {
+		if root, allocated, err := s.tracker().OpenAttempt(
+			ctx,
+			knowledge.ID,
+			"",
+		); err == nil && root != nil {
+			attempt = allocated
+		} else if err != nil {
+			logger.Warnf(
+				ctx,
+				"enqueueManualProcessing: OpenAttempt failed for %s: %v",
+				knowledge.ID,
+				err,
+			)
+		}
+	}
 	requestID, _ := types.RequestIDFromContext(ctx)
 	payload := types.ManualProcessPayload{
 		RequestId:       requestID,
@@ -1119,21 +1170,22 @@ func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
 		KnowledgeBaseID: knowledge.KnowledgeBaseID,
 		Content:         content,
 		NeedCleanup:     needCleanup,
+		Attempt:         attempt,
 	}
 	langfuse.InjectTracing(ctx, &payload)
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal manual process payload: %w", err)
+		return "", attempt, fmt.Errorf("failed to marshal manual process payload: %w", err)
 	}
 
 	task := asynq.NewTask(types.TypeManualProcess, payloadBytes,
 		asynq.Queue(types.QueueDefault), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
 	info, err := s.task.Enqueue(task)
 	if err != nil {
-		return "", fmt.Errorf("failed to enqueue manual process task: %w", err)
+		return "", attempt, fmt.Errorf("failed to enqueue manual process task: %w", err)
 	}
 	logger.Infof(ctx, "Enqueued manual process task: knowledge_id=%s, asynq_id=%s", knowledge.ID, info.ID)
-	return info.ID, nil
+	return info.ID, attempt, nil
 }
 
 // markKnowledgeEnqueueFailed prevents a durable knowledge row from remaining
@@ -1180,10 +1232,10 @@ func sanitizeManualDownloadFilename(title string) string {
 
 func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 	kb *types.KnowledgeBase, knowledge *types.Knowledge, content string, doSync bool,
-) {
+) error {
 	clean := strings.TrimSpace(content)
 	if clean == "" {
-		return
+		return nil
 	}
 
 	// Resolve embedded data:base64 images and remote http(s) images → storage, replace URLs.
@@ -1265,10 +1317,14 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 	}
 
 	if doSync {
-		s.processChunks(ctx, kb, knowledge, parsed, opts)
-		return
+		return s.processChunks(ctx, kb, knowledge, parsed, opts)
 	}
 
 	newCtx := logger.CloneContext(ctx)
-	go s.processChunks(newCtx, kb, knowledge, parsed, opts)
+	go func() {
+		if err := s.processChunks(newCtx, kb, knowledge, parsed, opts); err != nil {
+			logger.Warnf(newCtx, "manual chunk processing failed: error_class=%T", err)
+		}
+	}()
+	return nil
 }

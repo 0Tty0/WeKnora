@@ -13,6 +13,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
+	"github.com/Tencent/WeKnora/internal/artifact"
 	"github.com/Tencent/WeKnora/internal/config"
 	werrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
@@ -68,6 +69,7 @@ type knowledgeService struct {
 	kbShareService  interfaces.KBShareService
 	imageResolver   *docparser.ImageResolver
 	taskPendingRepo interfaces.TaskPendingOpsRepository
+	artifactRuntime *artifact.Runtime
 
 	// In-memory fallbacks for Lite mode (no Redis)
 	memFAQProgress      sync.Map // taskID -> *types.FAQImportProgress
@@ -118,6 +120,7 @@ func NewKnowledgeService(
 	taskPendingRepo interfaces.TaskPendingOpsRepository,
 	spanTracker SpanTracker,
 	audit interfaces.AuditLogService,
+	artifactRuntime *artifact.Runtime,
 ) (interfaces.KnowledgeService, error) {
 	return &knowledgeService{
 		config:          config,
@@ -147,6 +150,7 @@ func NewKnowledgeService(
 		taskPendingRepo: taskPendingRepo,
 		spanTracker:     spanTracker,
 		audit:           audit,
+		artifactRuntime: artifactRuntime,
 	}, nil
 }
 
@@ -193,7 +197,7 @@ func attemptFromCtx(ctx context.Context) int {
 // of 0 predates attempt tracking (or tracking is disabled) and is never treated
 // as superseded.
 func attemptSuperseded(ctx context.Context, tracker SpanTracker, knowledgeID string, attempt int) bool {
-	if attempt <= 0 || knowledgeID == "" {
+	if tracker == nil || attempt <= 0 || knowledgeID == "" {
 		return false
 	}
 	return tracker.LatestAttempt(ctx, knowledgeID) > attempt
@@ -279,7 +283,10 @@ func (s *knowledgeService) failStage(ctx context.Context, kid, name, code, msg s
 	if span == nil {
 		return
 	}
-	s.tracker().FailSpan(ctx, span, code, msg, err)
+	if err != nil {
+		msg = fmt.Sprintf("%s (error_class=%T)", msg, err)
+	}
+	s.tracker().FailSpan(ctx, span, code, msg, nil)
 }
 
 func (s *knowledgeService) skipStage(ctx context.Context, kid, name, reason string) {
