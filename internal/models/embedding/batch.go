@@ -2,7 +2,6 @@ package embedding
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"strconv"
 	"sync"
@@ -61,10 +60,10 @@ func (e *batchEmbedder) BatchEmbedWithPool(ctx context.Context, model Embedder, 
 				mu.Unlock()
 				return
 			}
-			if len(embedding) != len(texts) {
+			if err := ValidateEmbeddingBatch(embedding, len(texts), model.GetDimensions()); err != nil {
 				mu.Lock()
 				if firstErr == nil {
-					firstErr = fmt.Errorf("embedding model returned %d embeddings for %d inputs", len(embedding), len(texts))
+					firstErr = err
 				}
 				mu.Unlock()
 				return
