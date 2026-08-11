@@ -169,6 +169,121 @@ func TestBuildDesiredDocumentChunksParentIdentityAffectsChildren(t *testing.T) {
 	assert.NotEqual(t, desired.Text[0].ParentChunkID, desired.Text[1].ParentChunkID)
 }
 
+func TestPlanChunkReuseRequiresIndexedMatchingFingerprint(t *testing.T) {
+	matchingMetadata, err := withChunkEmbeddingFingerprint(nil, "fingerprint:alpha")
+	require.NoError(t, err)
+	staleMetadata, err := withChunkEmbeddingFingerprint(nil, "fingerprint:old")
+	require.NoError(t, err)
+
+	desired := []*types.Chunk{
+		{ID: "reuse", ChunkType: types.ChunkTypeText, Content: "alpha"},
+		{ID: "not-indexed", ChunkType: types.ChunkTypeText, Content: "alpha"},
+		{ID: "changed", ChunkType: types.ChunkTypeText, Content: "beta"},
+		{ID: "new", ChunkType: types.ChunkTypeText, Content: "gamma"},
+		{ID: "parent", ChunkType: types.ChunkTypeParentText, Content: "parent"},
+	}
+	existing := []*types.Chunk{
+		{ID: "reuse", Status: int(types.ChunkStatusIndexed), Metadata: matchingMetadata},
+		{ID: "not-indexed", Status: int(types.ChunkStatusDefault), Metadata: matchingMetadata},
+		{ID: "changed", Status: int(types.ChunkStatusIndexed), Metadata: staleMetadata},
+	}
+
+	plan, err := planChunkReuse(desired, existing, true, func(chunk *types.Chunk) (string, bool, error) {
+		return "fingerprint:" + chunk.Content, true, nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"reuse"}, chunkIDList(plan.Reuse))
+	assert.Equal(t, []string{"not-indexed", "changed", "new"}, chunkIDList(plan.Index))
+	assert.Equal(t, "fingerprint:gamma", plan.Fingerprints["new"])
+}
+
+func TestPlanChunkReuseFailsClosedWithoutFingerprint(t *testing.T) {
+	desired := []*types.Chunk{{
+		ID:        "chunk",
+		ChunkType: types.ChunkTypeText,
+		Content:   "unchanged",
+		Status:    int(types.ChunkStatusIndexed),
+	}}
+
+	plan, err := planChunkReuse(desired, desired, true, func(*types.Chunk) (string, bool, error) {
+		return "", false, nil
+	})
+	require.NoError(t, err)
+	assert.Empty(t, plan.Reuse)
+	assert.Equal(t, []string{"chunk"}, chunkIDList(plan.Index))
+	assert.Empty(t, plan.Fingerprints)
+}
+
+func TestChunkVectorFingerprintIncludesPublicationTarget(t *testing.T) {
+	strategy := types.IndexingStrategy{VectorEnabled: true}
+	firstStore := "store-a"
+	secondStore := "store-b"
+
+	base, err := chunkVectorFingerprint("embedding-key", &firstStore, "document", strategy)
+	require.NoError(t, err)
+	same, err := chunkVectorFingerprint("embedding-key", &firstStore, "document", strategy)
+	require.NoError(t, err)
+	assert.Equal(t, base, same)
+
+	changedStore, err := chunkVectorFingerprint("embedding-key", &secondStore, "document", strategy)
+	require.NoError(t, err)
+	assert.NotEqual(t, base, changedStore)
+
+	changedStrategy, err := chunkVectorFingerprint(
+		"embedding-key",
+		&firstStore,
+		"document",
+		types.IndexingStrategy{VectorEnabled: true, KeywordEnabled: true},
+	)
+	require.NoError(t, err)
+	assert.NotEqual(t, base, changedStrategy)
+
+	changedType, err := chunkVectorFingerprint("embedding-key", &firstStore, "faq", strategy)
+	require.NoError(t, err)
+	assert.NotEqual(t, base, changedType)
+}
+
+func TestMarkChunkEmbeddingsIndexedPreservesMetadata(t *testing.T) {
+	chunk := &types.Chunk{
+		ID:       "chunk",
+		Metadata: types.JSON(`{"owner":"user"}`),
+	}
+
+	err := markChunkEmbeddingsIndexed(
+		[]*types.Chunk{chunk},
+		map[string]string{"chunk": "fingerprint"},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, int(types.ChunkStatusIndexed), chunk.Status)
+	assert.Equal(t, "fingerprint", chunkEmbeddingFingerprint(chunk.Metadata))
+	metadata, err := chunk.Metadata.Map()
+	require.NoError(t, err)
+	assert.Equal(t, "user", metadata["owner"])
+}
+
+func TestChunkReuseSurvivesDesiredStateRebuild(t *testing.T) {
+	knowledge := reconcileKnowledge()
+	parsed := []types.ParsedChunk{parsedText("alpha", 0), parsedText("beta", 1)}
+	fingerprint := func(chunk *types.Chunk) (string, bool, error) {
+		return "artifact:" + chunk.Content, true, nil
+	}
+
+	first, err := buildDesiredDocumentChunks(knowledge, parsed, nil, nil)
+	require.NoError(t, err)
+	cold, err := planChunkReuse(first.Text, nil, true, fingerprint)
+	require.NoError(t, err)
+	require.Len(t, cold.Index, 2)
+	require.Empty(t, cold.Reuse)
+	require.NoError(t, markChunkEmbeddingsIndexed(cold.Index, cold.Fingerprints))
+
+	second, err := buildDesiredDocumentChunks(knowledge, parsed, nil, first.All)
+	require.NoError(t, err)
+	warm, err := planChunkReuse(second.Text, first.All, true, fingerprint)
+	require.NoError(t, err)
+	assert.Empty(t, warm.Index)
+	assert.Equal(t, chunkIDList(first.Text), chunkIDList(warm.Reuse))
+}
+
 func TestStableGeneratedQuestionsSurviveReordering(t *testing.T) {
 	knowledge := reconcileKnowledge()
 	parent := &types.Chunk{ID: uuid.New().String()}

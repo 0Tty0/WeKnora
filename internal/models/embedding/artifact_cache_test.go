@@ -105,6 +105,42 @@ func documentEmbeddingContext() context.Context {
 	return context.WithValue(context.Background(), types.EmbedDocumentContextKey, true)
 }
 
+func TestArtifactFingerprintMatchesEffectiveEmbeddingRequest(t *testing.T) {
+	runtime, _ := setupEmbeddingArtifactRuntime(t)
+	provider := &countingEmbedder{dimensions: 3}
+	cached := NewArtifactCachedEmbedder(provider, runtime, embeddingArtifactConfig())
+
+	first, available, err := ArtifactFingerprint(cached, "document\ncontent")
+	require.NoError(t, err)
+	require.True(t, available)
+	require.NotEmpty(t, first)
+
+	repeated, available, err := ArtifactFingerprint(cached, "document\ncontent")
+	require.NoError(t, err)
+	require.True(t, available)
+	assert.Equal(t, first, repeated)
+
+	changedInput, available, err := ArtifactFingerprint(cached, "document\nchanged")
+	require.NoError(t, err)
+	require.True(t, available)
+	assert.NotEqual(t, first, changedInput)
+
+	changedConfig := embeddingArtifactConfig()
+	changedConfig.Processor.Provider = "other-provider"
+	other := NewArtifactCachedEmbedder(provider, runtime, changedConfig)
+	changedProcessor, available, err := ArtifactFingerprint(other, "document\ncontent")
+	require.NoError(t, err)
+	require.True(t, available)
+	assert.NotEqual(t, first, changedProcessor)
+}
+
+func TestArtifactFingerprintUnavailableWithoutArtifactCache(t *testing.T) {
+	fingerprint, available, err := ArtifactFingerprint(&countingEmbedder{dimensions: 3}, "content")
+	require.NoError(t, err)
+	assert.False(t, available)
+	assert.Empty(t, fingerprint)
+}
+
 func TestArtifactCachedEmbeddingDeduplicatesAndPreservesExactInputOrder(t *testing.T) {
 	runtime, _ := setupEmbeddingArtifactRuntime(t)
 	provider := &countingEmbedder{dimensions: 3}

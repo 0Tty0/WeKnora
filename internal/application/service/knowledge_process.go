@@ -355,6 +355,29 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	insertChunks := desired.All
 	textChunks := desired.Text
 	previousStorageSize := knowledge.StorageSize
+	reusePlan, err := planChunkReuse(
+		textChunks,
+		existingChunks,
+		kb.NeedsEmbeddingModel() && embeddingModel != nil,
+		func(chunk *types.Chunk) (string, bool, error) {
+			input := buildKnowledgeIndexContent(knowledge, chunk.EmbeddingContent())
+			embeddingKey, available, err := embedding.ArtifactFingerprint(embeddingModel, input)
+			if err != nil || !available {
+				return "", available, err
+			}
+			fingerprint, err := chunkVectorFingerprint(
+				embeddingKey,
+				kb.VectorStoreID,
+				kb.Type,
+				kb.IndexingStrategy,
+			)
+			return fingerprint, true, err
+		},
+	)
+	if err != nil {
+		logger.Errorf(ctx, "Failed to plan chunk vector reuse: %v", err)
+		return err
+	}
 
 	// Check if knowledge is being deleted/cancelled before writing chunks.
 	// Nothing has been persisted yet, so both branches just bail.
@@ -441,7 +464,8 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	var totalStorageSize int64
 	if kb.NeedsEmbeddingModel() && embeddingModel != nil {
 		embedInput := types.JSONMap{
-			"chunks_to_embed": len(textChunks),
+			"chunks_to_embed": len(reusePlan.Index),
+			"vectors_reused":  len(reusePlan.Reuse),
 			"model_id":        kb.EmbeddingModelID,
 		}
 		if dim := embeddingModel.GetDimensions(); dim > 0 {
@@ -452,26 +476,34 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		// Parent chunks are stored for context retrieval but do not need vector embeddings.
 		// Prepend the document title to improve semantic alignment between
 		// question-style queries and statement-style chunk content.
-		indexInfoList := make([]*types.IndexInfo, 0, len(textChunks))
-		for _, chunk := range textChunks {
-			// chunk.EmbeddingContent prepends ContextHeader (heading breadcrumb)
-			// when the chunker populated it during Tier-1 splitting; falls back
-			// to plain Content otherwise. The document title sits outermost;
-			// custom metadata remains document-scoped model context.
-			indexContent := buildKnowledgeIndexContent(knowledge, chunk.EmbeddingContent())
-			indexInfoList = append(indexInfoList, &types.IndexInfo{
-				Content:         indexContent,
-				SourceID:        chunk.ID,
-				SourceType:      types.ChunkSourceType,
-				ChunkID:         chunk.ID,
-				KnowledgeID:     knowledge.ID,
-				KnowledgeBaseID: knowledge.KnowledgeBaseID,
-				IsEnabled:       true,
-			})
+		indexInfosFor := func(indexedChunks []*types.Chunk) []*types.IndexInfo {
+			indexInfoList := make([]*types.IndexInfo, 0, len(indexedChunks))
+			for _, chunk := range indexedChunks {
+				// chunk.EmbeddingContent prepends ContextHeader (heading breadcrumb)
+				// when the chunker populated it during Tier-1 splitting; falls back
+				// to plain Content otherwise. The document title sits outermost;
+				// custom metadata remains document-scoped model context.
+				indexContent := buildKnowledgeIndexContent(knowledge, chunk.EmbeddingContent())
+				indexInfoList = append(indexInfoList, &types.IndexInfo{
+					Content:         indexContent,
+					SourceID:        chunk.ID,
+					SourceType:      types.ChunkSourceType,
+					ChunkID:         chunk.ID,
+					KnowledgeID:     knowledge.ID,
+					KnowledgeBaseID: knowledge.KnowledgeBaseID,
+					IsEnabled:       true,
+				})
+			}
+			return indexInfoList
 		}
+		indexInfoList := indexInfosFor(reusePlan.Index)
 
 		// Calculate storage size required for embeddings
-		totalStorageSize = retrieveEngine.EstimateStorageSize(ctx, embeddingModel, indexInfoList)
+		totalStorageSize = retrieveEngine.EstimateStorageSize(
+			ctx,
+			embeddingModel,
+			indexInfosFor(textChunks),
+		)
 		if tenantInfo.StorageQuota > 0 {
 			// Re-fetch tenant storage information
 			tenantInfo, err = s.tenantRepo.GetTenantByID(ctx, tenantInfo.ID)
@@ -512,7 +544,9 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			return nil
 		}
 
-		err = retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList)
+		if len(indexInfoList) > 0 {
+			err = retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList)
+		}
 		if err != nil {
 			knowledge.ParseStatus = types.ParseStatusFailed
 			knowledge.ErrorMessage = err.Error()
@@ -549,12 +583,32 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 				code, "batch index failed", err)
 			return err
 		}
+		if len(reusePlan.Index) > 0 {
+			err = markChunkEmbeddingsIndexed(reusePlan.Index, reusePlan.Fingerprints)
+			if err == nil {
+				err = s.chunkRepo.SaveChunks(ctx, reusePlan.Index)
+			}
+			if err != nil {
+				knowledge.ParseStatus = types.ParseStatusFailed
+				knowledge.ErrorMessage = err.Error()
+				knowledge.UpdatedAt = time.Now()
+				_, _ = s.repo.UpdateKnowledgeIfAttemptCurrent(
+					ctx,
+					knowledge,
+					attemptFromCtx(ctx),
+				)
+				s.failStage(ctx, knowledge.ID, types.StageEmbedding,
+					werrors.ErrCodeVectorStoreWriteFailed, "persist vector reuse state failed", err)
+				return err
+			}
+		}
 		if err := artifact.InjectFault(ctx, artifact.FaultAfterVectorUpsert); err != nil {
 			return err
 		}
 		logger.GetLogger(ctx).Infof("processChunks batch index successfully, with %d index", len(indexInfoList))
 		s.endStage(ctx, knowledge.ID, types.StageEmbedding, types.JSONMap{
 			"vectors_written": len(indexInfoList),
+			"vectors_reused":  len(reusePlan.Reuse),
 			"storage_bytes":   totalStorageSize,
 		})
 

@@ -396,6 +396,22 @@ func (e *artifactCachedEmbedder) expected(text string) (artifact.Expected, error
 	}, nil
 }
 
+// ArtifactFingerprint returns the canonical artifact key for a document
+// embedding request. Callers can use it to prove that an already-published
+// vector was produced from the same effective model request. Embedders without
+// the artifact wrapper fail closed and do not expose a reusable fingerprint.
+func ArtifactFingerprint(embedder Embedder, text string) (string, bool, error) {
+	cached, ok := embedder.(*artifactCachedEmbedder)
+	if !ok {
+		return "", false, nil
+	}
+	expected, err := cached.expected(text)
+	if err != nil {
+		return "", false, err
+	}
+	return expected.Key.Lookup.ArtifactKey, true, nil
+}
+
 func (e *artifactCachedEmbedder) GetModelName() string {
 	return e.inner.GetModelName()
 }
